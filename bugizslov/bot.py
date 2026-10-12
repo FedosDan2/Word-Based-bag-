@@ -1,10 +1,11 @@
 import asyncio
 import json
 import logging
-from io import BytesIO
+import re
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import (
     BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -13,7 +14,7 @@ from aiogram.types import (
 
 from .config import Settings
 from .llm import ALLOWED_FIELDS, LLMError, OpenAICompatibleProvider
-from .report import FIELDS, render_report
+from .report import FIELDS, render_report, render_report_html
 from .secrets import contains_secret
 from .storage import Storage
 
@@ -63,15 +64,25 @@ def session_fields(row: Any) -> dict[str, Any]:
         return {}
 
 
+def page_is_complete(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    normalized = value.strip().lower()
+    if normalized in {"не указано", "не знаю", "unknown", "null"}:
+        return True
+    return bool(
+        re.search(r"https?://|www\.", normalized)
+        or re.search(r"(?:сайт|приложение|сервис)\s*/?\s*(?:приложение)?\s*:", normalized)
+    )
+
+
 async def build_report(message: Message, storage: Storage, session: Any, fields: dict[str, Any]) -> None:
     markdown = render_report(fields)
     storage.save_report(session["id"], fields, markdown)
     storage.update_session(session["id"], stage="report", pending_field=None)
     storage.save_message(session["id"], "bot", "Сформирован черновик отчёта.")
-    display = markdown
-    if len(display) > 3900:
-        display = display[:3850] + "\n…\n\nПолный текст можно скачать в .md файле."
-    await message.answer(display, reply_markup=report_keyboard())
+    display = render_report_html(fields)
+    await message.answer(display, parse_mode=ParseMode.HTML, reply_markup=report_keyboard())
 
 
 async def run_bot(settings: Settings) -> None:
@@ -120,6 +131,10 @@ async def run_bot(settings: Settings) -> None:
     async def unknown(callback: CallbackQuery) -> None:
         session = storage.get_active_session(callback.from_user.id)
         if session and session["stage"] == "collecting":
+            if session["pending_field"] == "page":
+                fields = session_fields(session)
+                fields["page"] = "Не указано"
+                storage.update_session(session["id"], extracted_data=fields, pending_field=None)
             storage.save_message(session["id"], "user", "На вопрос бота: не знаю / не указано.")
             await process_turn(callback.message, session)
         await callback.answer()
@@ -170,9 +185,17 @@ async def run_bot(settings: Settings) -> None:
     @dp.callback_query(F.data == "download")
     async def download(callback: CallbackQuery) -> None:
         session = storage.get_active_session(callback.from_user.id)
-        report = storage.db.execute("SELECT md_text FROM bug_reports WHERE session_id=?", (session["id"],)).fetchone() if session else None
-        if report:
-            doc = BufferedInputFile(report["md_text"].encode("utf-8"), filename="bug-report.md")
+        report = storage.db.execute("SELECT id FROM bug_reports WHERE session_id=?", (session["id"],)).fetchone() if session else None
+        if session and report:
+            fields = session_fields(session)
+            markdown = render_report(fields)
+            storage.save_report(session["id"], fields, markdown)
+            await callback.message.answer(
+                render_report_html(fields),
+                parse_mode=ParseMode.HTML,
+                reply_markup=report_keyboard(),
+            )
+            doc = BufferedInputFile(markdown.encode("utf-8"), filename="bug-report.md")
             await callback.message.answer_document(doc, caption="Ваш баг-репорт в Markdown.")
         else:
             await callback.message.answer("Сначала сформируйте отчёт.")
@@ -186,13 +209,43 @@ async def run_bot(settings: Settings) -> None:
         if not storage.record_request(current["user_id"], settings.user_requests_per_hour):
             await message.answer("Достигнут часовой лимит запросов. Попробуйте позже.")
             return
+        thinking = await message.answer("⏳ Анализирую описание, скоро продолжим…")
+
+        async def clear_thinking() -> None:
+            try:
+                await thinking.delete()
+            except Exception:
+                log.debug("Could not remove temporary thinking message", exc_info=True)
+
         try:
             result = await llm.analyze(storage.get_messages(current["id"]), fields)
-        except LLMError:
+        except LLMError as exc:
+            await clear_thinking()
+            if exc.status_code == 403:
+                log.warning("LLM provider denied access to the configured model (HTTP 403)")
+                await message.answer(
+                    "Token Harbor отказал в доступе к выбранной модели (403). "
+                    "Проверьте в кабинете Token Harbor точный ID модели и доступность этой модели для вашего API-ключа. "
+                    "Подробность отказа можно посмотреть в Request Logs."
+                )
+                return
             await message.answer("Модель задумалась, повторите сообщение чуть позже.")
             return
+        await clear_thinking()
         fields = result["extracted_fields"]
         rounds = current["question_rounds"] + 1
+        page = fields.get("page")
+        if not page_is_complete(page) and rounds < settings.max_question_rounds:
+            question = (
+                "На каком сайте или в какой части приложения возникла ошибка? "
+                "Укажите страницу или адрес тестовой среды. Если не знаете, нажмите «Не знаю»."
+            )
+            storage.update_session(
+                current["id"], extracted_data=fields, question_rounds=rounds, pending_field="page"
+            )
+            storage.save_message(current["id"], "bot", question)
+            await message.answer(question, reply_markup=question_keyboard())
+            return
         storage.update_session(current["id"], extracted_data=fields, question_rounds=rounds)
         if result["is_ready_for_report"] or rounds >= settings.max_question_rounds:
             await build_report(message, storage, current, fields)
@@ -226,8 +279,23 @@ async def run_bot(settings: Settings) -> None:
                 storage.save_message(session["id"], "user", f"Исправлено поле {session['pending_field']}: {text.strip()}")
                 await message.answer("Ответ обновлён. Продолжим уточнение.", reply_markup=question_keyboard())
             return
+        if stage == "collecting" and session["pending_field"] == "page":
+            fields = session_fields(session)
+            answer = text.strip()
+            fields["page"] = (
+                "Не указано"
+                if answer.lower() in {"не знаю", "не указано", "не помню"}
+                else answer if re.match(r"(?i)^(https?://|www\.|сайт\s*:|приложение\s*:|сервис\s*:)", answer)
+                else f"Сайт/приложение: {answer}"
+            )
+            storage.update_session(session["id"], extracted_data=fields, pending_field=None)
         if stage == "report":
-            await message.answer("Отчёт уже готов. Используйте кнопки, чтобы исправить поле или начать новый баг.")
+            fields = session_fields(session)
+            await message.answer(
+                render_report_html(fields),
+                parse_mode=ParseMode.HTML,
+                reply_markup=report_keyboard(),
+            )
             return
         storage.save_message(session["id"], "user", text)
         await process_turn(message, session)
